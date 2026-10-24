@@ -28,8 +28,12 @@ class BaseMapDataset(Dataset):
         interval (int): annotation load interval
         work_dir (str): path to work dir
         test_mode (bool): whether in test mode
+        temporal_direction (str): 'past' (default, MapTracker) or 'future' (AMap teacher).
+            With 'future', the time axis is reversed: training clips are sampled from
+            the future frames, and test-time scenes are processed from the last frame
+            to the first one.
     """
-    def __init__(self, 
+    def __init__(self,
                  ann_file,
                  cat2id,
                  roi_size,
@@ -44,12 +48,15 @@ class BaseMapDataset(Dataset):
                  sampling_span=10,
                  matching=False,
                  eval_semantic=False,
+                 temporal_direction='past',
         ):
         super().__init__()
         self.ann_file = ann_file
         self.multi_frame = multi_frame
         self.sampling_span = sampling_span
         self.matching = matching
+        assert temporal_direction in ['past', 'future']
+        self.temporal_direction = temporal_direction
         
         self.meta = meta
         self.classes = list(cat2id.keys())
@@ -60,6 +67,11 @@ class BaseMapDataset(Dataset):
         self.eval_semantic = eval_semantic
 
         self.load_annotations(self.ann_file)
+
+        # Future-aware inference runs every scene backwards in time
+        if self.temporal_direction == 'future' and test_mode:
+            assert not multi_frame, 'reversed scene order is only for sequential inference'
+            self._reverse_scene_order()
 
         if matching:
             assert self.multi_frame, 'The matching info has to loaded under the multi-frame setting'
@@ -93,6 +105,22 @@ class BaseMapDataset(Dataset):
         self._set_sequence_group_flag()
         
     
+    def _reverse_scene_order(self):
+        """Reverse the frame order inside each scene (scene order is kept), so that the
+        sequential inference sees the future frames as its history.
+        """
+        scene2samples = {}
+        for sample in self.samples:
+            scene2samples.setdefault(sample['scene_name'], []).append(sample)
+        reversed_samples = []
+        for scene_samples in scene2samples.values():
+            for i, sample in enumerate(scene_samples[::-1]):
+                # 'prev' is the index of the previous sample, -1 marks a new sequence
+                sample['prev'] = -1 if i == 0 else len(reversed_samples) - 1
+                reversed_samples.append(sample)
+        self.samples = reversed_samples
+        print('Reversed the frame order of {} scenes for future-aware inference'.format(len(scene2samples)))
+
     def _set_sequence_info(self):
         """Compute and record the sequence id and local index of each sample
         """
@@ -461,13 +489,26 @@ class BaseMapDataset(Dataset):
             local_idx_curr = input_dict['sample_idx'] - scene_seq_info[0]
 
             span = max(self.sampling_span, self.multi_frame)
-            min_idx = local_idx_curr - span
             sampled_indices = np.random.choice(span, self.multi_frame-1, replace=False).tolist()
             sampled_indices = sorted(sampled_indices)
-            local_indices_prev = [min_idx + x for x in sampled_indices]
-            local_indices_prev = [x if x>=0 else 0 for x in local_indices_prev]
-            
-            data['img_metas'].data['local_idx'] = local_idx_curr
+            if self.temporal_direction == 'past':
+                min_idx = local_idx_curr - span
+                local_indices_prev = [min_idx + x for x in sampled_indices]
+                local_indices_prev = [x if x>=0 else 0 for x in local_indices_prev]
+            else:
+                # Reversed time: the "prev" frames are future frames, ordered from the
+                # farthest one to the nearest one, so that the model iterates towards curr
+                max_idx = local_idx_curr + span
+                local_indices_prev = [max_idx - x for x in sampled_indices]
+                local_indices_prev = [min(x, len(scene_seq_info)-1) for x in local_indices_prev]
+
+            def _model_time_idx(local_idx):
+                # the index seen by the model, increasing along the model's time axis
+                if self.temporal_direction == 'past':
+                    return local_idx
+                return len(scene_seq_info) - 1 - local_idx
+
+            data['img_metas'].data['local_idx'] = _model_time_idx(local_idx_curr)
             global_indices_prev = [local_idx + scene_seq_info[0] for local_idx in local_indices_prev]
 
             all_prev_data = []
@@ -475,17 +516,19 @@ class BaseMapDataset(Dataset):
                 input_dict_prev = self.get_sample(global_idx_prev)
                 data_prev = self.pipeline(input_dict_prev)
                 local_idx_prev = local_indices_prev[idx]
-                data_prev['img_metas'].data['local_idx'] = local_idx_prev
+                data_prev['img_metas'].data['local_idx'] = _model_time_idx(local_idx_prev)
                 all_prev_data.append(data_prev)
 
+            # The instance ids in the matching info are global inside each scene,
+            # so the matching works for both time directions
             all_local2global_info = []
             if self.matching:
                 scene_matching_info = self.matching_meta[scene_name]
                 for local_idx_prev in local_indices_prev:
                     prev_local2global = DC(scene_matching_info['instance_ids'][local_idx_prev], cpu_only=True)
                     all_local2global_info.append(prev_local2global)
-            curr_local2global = DC(scene_matching_info['instance_ids'][local_idx_curr], cpu_only=True)
-            all_local2global_info.append(curr_local2global)
+                curr_local2global = DC(scene_matching_info['instance_ids'][local_idx_curr], cpu_only=True)
+                all_local2global_info.append(curr_local2global)
                     
             data['all_prev_data'] = all_prev_data
             data['all_local2global_info'] = all_local2global_info

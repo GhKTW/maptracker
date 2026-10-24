@@ -7,7 +7,7 @@ from .AP import instance_match, average_precision
 import prettytable
 from time import time
 from functools import cached_property
-from shapely.geometry import LineString
+from shapely.geometry import LineString, box
 from numpy.typing import NDArray
 from typing import Dict, List, Optional
 from logging import Logger
@@ -20,6 +20,37 @@ THRESHOLDS = [0.5, 1.0, 1.5] # AP thresholds
 N_WORKERS = 16 # num workers to parallel
 SAMPLE_DIST = 0.15
 
+# AMap A-mAP / R-mAP: the ROI is split at x=0 (x-axis = ego heading) into the ahead and
+# rear halves, map elements are clipped to each half and evaluated as the global mAP
+_HALF_PLANE = 1e4
+REGION_BOXES = {
+    'ahead': box(0, -_HALF_PLANE, _HALF_PLANE, _HALF_PLANE),
+    'rear': box(-_HALF_PLANE, -_HALF_PLANE, 0, _HALF_PLANE),
+}
+REGION_PREFIX = {None: '', 'ahead': 'A-', 'rear': 'R-'}
+
+
+def clip_vectors_to_region(vectors: List, region: str, scores: Optional[List]=None):
+    ''' Clip polylines to a half region, a polyline crossing the border may give several pieces.
+
+    Returns:
+        clipped_vectors (List[NDArray]), clipped_scores (List[float] or None)
+    '''
+    region_box = REGION_BOXES[region]
+    clipped_vectors, clipped_scores = [], []
+    for i, vector in enumerate(vectors):
+        vector = np.array(vector)
+        if len(vector) < 2:
+            continue
+        clipped = LineString(vector).intersection(region_box)
+        pieces = getattr(clipped, 'geoms', [clipped])
+        for piece in pieces:
+            if piece.geom_type == 'LineString' and piece.length > 0:
+                clipped_vectors.append(np.array(piece.coords))
+                if scores is not None:
+                    clipped_scores.append(scores[i])
+    return clipped_vectors, (clipped_scores if scores is not None else None)
+
 
 class VectorEvaluate(object):
     """Evaluator for vectorized map.
@@ -29,8 +60,10 @@ class VectorEvaluate(object):
         n_workers (int): num workers to parallel
     """
 
-    def __init__(self, dataset_cfg: Config, n_workers: int=N_WORKERS) -> None:
+    def __init__(self, dataset_cfg: Config, n_workers: int=N_WORKERS, eval_regions: bool=True) -> None:
         self.dataset = build_dataset(dataset_cfg)
+        # also report A-mAP / R-mAP (ahead / rear halves of the ROI)
+        self.eval_regions = eval_regions
         self.cat2id = self.dataset.cat2id
         self.id2cat = {v: k for k, v in self.cat2id.items()}
         self.n_workers = n_workers
@@ -119,20 +152,25 @@ class VectorEvaluate(object):
                          pred_vectors: List, 
                          scores: List, 
                          groundtruth: List, 
-                         thresholds: List, 
-                         metric: str='metric') -> Dict[int, NDArray]:
+                         thresholds: List,
+                         metric: str='metric',
+                         region: Optional[str]=None) -> Dict[int, NDArray]:
         ''' Do single-frame matching for one class.
-        
+
         Args:
-            pred_vectors (List): List[vector(ndarray) (different length)], 
+            pred_vectors (List): List[vector(ndarray) (different length)],
             scores (List): List[score(float)]
             groundtruth (List): List of vectors
             thresholds (List): List of thresholds
-        
+            region (str): None for the whole ROI, 'ahead' / 'rear' for the half regions
+
         Returns:
             tp_fp_score_by_thr (Dict): matching results at different thresholds
                 e.g. {0.5: (M, 2), 1.0: (M, 2), 1.5: (M, 2)}
         '''
+        if region is not None:
+            pred_vectors, scores = clip_vectors_to_region(pred_vectors, region, scores)
+            groundtruth, _ = clip_vectors_to_region(groundtruth, region)
 
         pred_lines = []
 
@@ -163,8 +201,10 @@ class VectorEvaluate(object):
             tp, fp = tp_fp_list[i]
             tp_fp_score = np.hstack([tp[:, None], fp[:, None], scores[:, None]])
             tp_fp_score_by_thr[thr] = tp_fp_score
-        
-        return tp_fp_score_by_thr # {0.5: (M, 2), 1.0: (M, 2), 1.5: (M, 2)}
+        # number of (clipped) G.T. instances, the denominator of the recall
+        tp_fp_score_by_thr['num_gts'] = len(gt_lines)
+
+        return tp_fp_score_by_thr # {0.5: (M, 2), 1.0: (M, 2), 1.5: (M, 2), 'num_gts': int}
         
     def evaluate(self, 
                  result_path: str, 
@@ -216,88 +256,96 @@ class VectorEvaluate(object):
                 num_preds[label] += len(scores_by_cls[label])
                 samples_by_cls[label].append(new_sample)
 
-        result_dict = {}
-
-        print(f'\nevaluating {len(self.id2cat)} categories...')
-        start = time()
+        from mmcv.utils import print_log
         if self.n_workers > 0:
             pool = Pool(self.n_workers)
-        
-        sum_mAP = 0
-        pbar = mmcv.ProgressBar(len(self.id2cat))
-        for label in self.id2cat.keys():
-            samples = samples_by_cls[label] # List[(pred_lines, scores, gts)]
-            result_dict[self.id2cat[label]] = {
-                'num_gts': num_gts[label],
-                'num_preds': num_preds[label]
-            }
-            sum_AP = 0
 
-            fn = partial(self._evaluate_single, thresholds=self.thresholds, metric=metric)
-            if self.n_workers > 0:
-                tpfp_score_list = pool.starmap(fn, samples)
-            else:
-                tpfp_score_list = []
-                for sample in samples:
-                    tpfp_score_list.append(fn(*sample))
-            
-            for thr in self.thresholds:
-                tp_fp_score = [i[thr] for i in tpfp_score_list]
-                tp_fp_score = np.vstack(tp_fp_score) # (num_dets, 3)
-                sort_inds = np.argsort(-tp_fp_score[:, -1])
+        regions = [None, 'ahead', 'rear'] if self.eval_regions else [None]
+        new_result_dict = {}
+        for region in regions:
+            result_dict = {}
+            prefix = REGION_PREFIX[region]
 
-                tp = tp_fp_score[sort_inds, 0] # (num_dets,)
-                fp = tp_fp_score[sort_inds, 1] # (num_dets,)
-                tp = np.cumsum(tp, axis=0)
-                fp = np.cumsum(fp, axis=0)
-                eps = np.finfo(np.float32).eps
-                recalls = tp / np.maximum(num_gts[label], eps)
-                precisions = tp / np.maximum((tp + fp), eps)
+            print(f'\nevaluating {len(self.id2cat)} categories, region: {region if region else "all"}...')
+            start = time()
 
-                AP = average_precision(recalls, precisions, 'area')
-                sum_AP += AP
-                result_dict[self.id2cat[label]].update({f'AP@{thr}': AP})
+            sum_mAP = 0
+            pbar = mmcv.ProgressBar(len(self.id2cat))
+            for label in self.id2cat.keys():
+                samples = samples_by_cls[label] # List[(pred_lines, scores, gts)]
+                sum_AP = 0
 
-            pbar.update()
-            
-            AP = sum_AP / len(self.thresholds)
-            sum_mAP += AP
+                fn = partial(self._evaluate_single, thresholds=self.thresholds, metric=metric, region=region)
+                if self.n_workers > 0:
+                    tpfp_score_list = pool.starmap(fn, samples)
+                else:
+                    tpfp_score_list = []
+                    for sample in samples:
+                        tpfp_score_list.append(fn(*sample))
 
-            result_dict[self.id2cat[label]].update({f'AP': AP})
-        
+                # the clipped G.T. count for the half regions, equals num_gts[label] otherwise
+                num_gts_label = sum([i['num_gts'] for i in tpfp_score_list])
+                result_dict[self.id2cat[label]] = {
+                    'num_gts': num_gts_label,
+                    'num_preds': sum([len(i[self.thresholds[0]]) for i in tpfp_score_list]),
+                }
+
+                for thr in self.thresholds:
+                    tp_fp_score = [i[thr] for i in tpfp_score_list]
+                    tp_fp_score = np.vstack(tp_fp_score) # (num_dets, 3)
+                    sort_inds = np.argsort(-tp_fp_score[:, -1])
+
+                    tp = tp_fp_score[sort_inds, 0] # (num_dets,)
+                    fp = tp_fp_score[sort_inds, 1] # (num_dets,)
+                    tp = np.cumsum(tp, axis=0)
+                    fp = np.cumsum(fp, axis=0)
+                    eps = np.finfo(np.float32).eps
+                    recalls = tp / np.maximum(num_gts_label, eps)
+                    precisions = tp / np.maximum((tp + fp), eps)
+
+                    AP = average_precision(recalls, precisions, 'area')
+                    sum_AP += AP
+                    result_dict[self.id2cat[label]].update({f'AP@{thr}': AP})
+
+                pbar.update()
+
+                AP = sum_AP / len(self.thresholds)
+                sum_mAP += AP
+
+                result_dict[self.id2cat[label]].update({f'AP': AP})
+
+            mAP = sum_mAP / len(self.id2cat.keys())
+            result_dict.update({'mAP': mAP})
+
+            print(f"finished in {time() - start:.2f}s")
+
+            # print results
+            table = prettytable.PrettyTable(['category', 'num_preds', 'num_gts'] +
+                    [f'{prefix}AP@{thr}' for thr in self.thresholds] + [f'{prefix}AP'])
+            for label in self.id2cat.keys():
+                table.add_row([
+                    self.id2cat[label],
+                    result_dict[self.id2cat[label]]['num_preds'],
+                    result_dict[self.id2cat[label]]['num_gts'],
+                    *[round(result_dict[self.id2cat[label]][f'AP@{thr}'], 4) for thr in self.thresholds],
+                    round(result_dict[self.id2cat[label]]['AP'], 4),
+                ])
+
+            print_log('\n'+str(table), logger=logger)
+            mAP_normal = 0
+            for label in self.id2cat.keys():
+                for thr in self.thresholds:
+                    mAP_normal += result_dict[self.id2cat[label]][f'AP@{thr}']
+            mAP_normal = mAP_normal / 9
+
+            print_log(f'{prefix}mAP_normal = {mAP_normal:.4f}\n', logger=logger)
+            # print_log(f'mAP_hard = {mAP_easy:.4f}\n', logger=logger)
+
+            for name in self.cat2id:
+                new_result_dict[prefix + name] = result_dict[name]['AP']
+            new_result_dict[prefix + 'mAP'] = mAP
+
         if self.n_workers > 0:
             pool.close()
-        
-        mAP = sum_mAP / len(self.id2cat.keys())
-        result_dict.update({'mAP': mAP})
-        
-        print(f"finished in {time() - start:.2f}s")
-
-        # print results
-        table = prettytable.PrettyTable(['category', 'num_preds', 'num_gts'] + 
-                [f'AP@{thr}' for thr in self.thresholds] + ['AP'])
-        for label in self.id2cat.keys():
-            table.add_row([
-                self.id2cat[label], 
-                result_dict[self.id2cat[label]]['num_preds'],
-                result_dict[self.id2cat[label]]['num_gts'],
-                *[round(result_dict[self.id2cat[label]][f'AP@{thr}'], 4) for thr in self.thresholds],
-                round(result_dict[self.id2cat[label]]['AP'], 4),
-            ])
-        
-        from mmcv.utils import print_log
-        print_log('\n'+str(table), logger=logger)
-        mAP_normal = 0
-        for label in self.id2cat.keys():
-            for thr in self.thresholds:
-                mAP_normal += result_dict[self.id2cat[label]][f'AP@{thr}']
-        mAP_normal = mAP_normal / 9
-
-        print_log(f'mAP_normal = {mAP_normal:.4f}\n', logger=logger)
-        # print_log(f'mAP_hard = {mAP_easy:.4f}\n', logger=logger)
-
-        new_result_dict = {}
-        for name in self.cat2id:
-            new_result_dict[name] = result_dict[name]['AP']
 
         return new_result_dict

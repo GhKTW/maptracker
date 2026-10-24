@@ -41,8 +41,15 @@ class MapTracker(BaseMapper):
                  use_memory=False,
                  mem_len=None,
                  mem_warmup_iters=-1,
+                 temporal=True,
                  **kwargs):
         super().__init__()
+        # temporal=False: current-frame-only model (AMap student), no BEV memory,
+        # no track query propagation and no vector memory at both training and test time
+        self.temporal = temporal
+        if not temporal:
+            assert not use_memory and not history_steps, \
+                'a current-frame-only model must not use history_steps / use_memory'
 
         #Attribute
         self.model_name = model_name
@@ -66,7 +73,8 @@ class MapTracker(BaseMapper):
 
         # the track query propagation module, using relative pose
         c_dim = 7 # quaternion for rotation (4) + translation (3)
-        self.query_propagate = MotionMLP(c_dim=c_dim, f_dim=self.head.embed_dims, identity=True)
+        if temporal:
+            self.query_propagate = MotionMLP(c_dim=c_dim, f_dim=self.head.embed_dims, identity=True)
 
         # BEV semantic seg head
         self.seg_decoder = build_head(seg_cfg)
@@ -245,7 +253,8 @@ class MapTracker(BaseMapper):
                     trans_cls_loss += trans_score
 
                     # backward trans loss
-                    pose_matrix_inv = torch.inverse(trans_matrix).float()[:3]
+                    # invert on cpu: cusolver of torch1.9+cu111 fails on RTX 40 series
+                    pose_matrix_inv = torch.inverse(trans_matrix.cpu()).to(trans_matrix.device).float()[:3]
                     rot_mat_inv = pose_matrix_inv[:, :3].cpu().numpy()
 
                     rot_inv = R.from_matrix(rot_mat_inv)
@@ -342,8 +351,10 @@ class MapTracker(BaseMapper):
         
 
     def forward_train(self, img, vectors, semantic_mask, points=None, img_metas=None, all_prev_data=None,
-                      all_local2global_info=None, **kwargs):
+                      all_local2global_info=None, return_kd_outputs=False, **kwargs):
         '''
+        If return_kd_outputs, additionally return the current-frame outputs used by the
+        AMap distillation: basic/refined BEV and the last decoder layer predictions.
         Args:
             img: torch.Tensor of shape [B, N, 3, H, W]
                 N: number of cams
@@ -366,7 +377,8 @@ class MapTracker(BaseMapper):
         _use_memory = self.use_memory and self.num_iter > self.mem_warmup_iters
         
         if all_prev_data is not None:
-            num_prev_frames = len(all_prev_data)        
+            assert self.temporal, 'a current-frame-only model does not take history frames'
+            num_prev_frames = len(all_prev_data)
             all_gts_prev, all_img_prev, all_img_metas_prev, all_semantic_mask_prev  = [], [], [], []
             for prev_data in all_prev_data:
                 gts_prev, img_prev, img_metas_prev, valid_idx_prev, _ = self.batch_data(
@@ -507,8 +519,9 @@ class MapTracker(BaseMapper):
 
         all_history_curr2prev, all_history_prev2curr, all_history_coord = self.process_history_info(img_metas, history_img_metas)
 
-        _bev_feats, mlvl_feats = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
-                    points=None, img_backbone_gradient=img_backbone_gradient)
+        backbone_outs = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
+                    points=None, img_backbone_gradient=img_backbone_gradient, return_basic=return_kd_outputs)
+        _bev_feats, mlvl_feats = backbone_outs[:2]
         # Neck for curr
         bev_feats = self.neck(_bev_feats)
 
@@ -581,6 +594,16 @@ class MapTracker(BaseMapper):
         
         log_vars.update({'total': loss.item()})
         num_sample = img.size(0)
+
+        if return_kd_outputs:
+            assert not self.skip_vector_head
+            kd_outputs = {
+                'bev_basic': backbone_outs[2],
+                'bev_refined': bev_feats,
+                'lines': preds_list[-1]['lines'], # List[(num_q, 2*num_points)], normalized
+                'scores': preds_list[-1]['scores'], # List[(num_q, num_classes)], logits
+            }
+            return loss, log_vars, num_sample, kd_outputs
         return loss, log_vars, num_sample
 
     @torch.no_grad()
@@ -594,78 +617,18 @@ class MapTracker(BaseMapper):
         tokens = []
         for img_meta in img_metas:
             tokens.append(img_meta['token'])
-        
+
         scene_name, local_idx, seq_length  = seq_info[0]
-        first_frame = (local_idx == 0)
         img_metas[0]['local_idx'] = local_idx
-    
-        if first_frame:
-            if self.use_memory:
-                self.memory_bank.set_bank_size(self.test_time_history_steps)
-                #self.memory_bank.set_bank_size(self.mem_len)
-                self.memory_bank.init_memory(bs=1)
-            self.history_bev_feats_all = []
-            self.history_img_metas_all = []
-        
-        if self.use_memory:
-            self.memory_bank.curr_t = local_idx
-        
-        selected_mem_ids = self.select_memory_entries(self.history_img_metas_all, img_metas)
-        history_img_metas = [self.history_img_metas_all[idx] for idx in selected_mem_ids]
-        history_bev_feats = [self.history_bev_feats_all[idx] for idx in selected_mem_ids]
 
-        all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
-                    self.process_history_info(img_metas, history_img_metas)
+        # a current-frame-only model treats every frame as the first frame of a sequence
+        step = local_idx if self.temporal else 0
+        step_outs = self._test_step(img, img_metas, scene_name, step, points=points)
+        preds_dict = step_outs['preds_dict']
+        seg_preds = step_outs['seg_preds']
+        track_dict = step_outs['track_dict']
+        pos_results = step_outs['pos_results']
 
-        _bev_feats, mlvl_feats = self.backbone(img, img_metas, local_idx, history_bev_feats, history_img_metas,
-                        all_history_coord, points=points)
-        
-        img_shape = [_bev_feats.shape[2:] for i in range(_bev_feats.shape[0])]
-        # Neck
-        bev_feats = self.neck(_bev_feats)
-
-        if self.skip_vector_head or first_frame:
-            self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, \
-                    all_history_prev2curr, self.use_memory, track_query_info=None)
-            seg_preds, seg_feats = self.seg_decoder(bev_features=bev_feats, return_loss=False)
-            if not self.skip_vector_head:
-                preds_list = self.head(bev_feats, img_metas=img_metas, return_loss=False)
-            track_dict = None
-        else:
-            # Using the saved prev-frame output to prepare the track query inputs
-            track_query_info = self.head.get_track_info(scene_name, local_idx)
-            # Transform prev-frame feature & pts to curr frame using the relative pose
-            self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, 
-                all_history_prev2curr, self.use_memory, track_query_info)
-            seg_preds, seg_feats = self.seg_decoder(bev_features=bev_feats, return_loss=False)
-
-            # Run the vector map decoder with instance-level memory
-            memory_bank = self.memory_bank if self.use_memory else None
-            preds_list = self.head(bev_feats, img_metas=img_metas, 
-                        track_query_info=track_query_info, memory_bank=memory_bank,
-                        return_loss=False)
-            track_dict = self._process_track_query_info(track_query_info)
-            
-        if not self.skip_vector_head:
-            # take predictions from the last layer
-            preds_dict = preds_list[-1]
-        else:
-            preds_dict = None
-
-        # Save the BEV and meta-info history 
-        self.history_bev_feats_all.append(bev_feats)
-        self.history_img_metas_all.append(img_metas)
-
-        if len(self.history_bev_feats_all) > self.test_time_history_steps:
-            self.history_bev_feats_all.pop(0)
-            self.history_img_metas_all.pop(0)
-        
-        if not self.skip_vector_head:
-            memory_bank = self.memory_bank if self.use_memory else None
-            thr_det = 0.4 if first_frame else 0.6
-            pos_results = self.head.prepare_temporal_propagation(preds_dict, scene_name, local_idx, 
-                                        memory_bank, thr_track=0.5, thr_det=thr_det)
-    
         if not self.skip_vector_head:
             results_list = self.head.post_process(preds_dict, tokens, track_dict)
             results_list[0]['pos_results'] = pos_results
@@ -690,6 +653,126 @@ class MapTracker(BaseMapper):
                 results_list[b_i]['token'] = tokens[b_i]
 
         return results_list
+
+    def _test_step(self, img, img_metas, scene_name, step, points=None, return_basic=False):
+        '''
+            One step of the sequential inference (bs=1).
+            step: index of the frame inside the processed sequence, 0 starts a new sequence
+            img_metas[0]['local_idx']: frame index used for the relative time PE of the vector memory
+        '''
+        first_frame = (step == 0)
+
+        if first_frame:
+            if self.use_memory:
+                self.memory_bank.set_bank_size(self.test_time_history_steps)
+                #self.memory_bank.set_bank_size(self.mem_len)
+                self.memory_bank.init_memory(bs=1)
+            self.history_bev_feats_all = []
+            self.history_img_metas_all = []
+
+        if self.use_memory:
+            self.memory_bank.curr_t = step
+
+        if self.temporal:
+            selected_mem_ids = self.select_memory_entries(self.history_img_metas_all, img_metas)
+        else:
+            selected_mem_ids = []
+        history_img_metas = [self.history_img_metas_all[idx] for idx in selected_mem_ids]
+        history_bev_feats = [self.history_bev_feats_all[idx] for idx in selected_mem_ids]
+
+        all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
+                    self.process_history_info(img_metas, history_img_metas)
+
+        backbone_outs = self.backbone(img, img_metas, step, history_bev_feats, history_img_metas,
+                        all_history_coord, points=points, return_basic=return_basic)
+        _bev_feats = backbone_outs[0]
+
+        # Neck
+        bev_feats = self.neck(_bev_feats)
+
+        if self.skip_vector_head or first_frame:
+            self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, \
+                    all_history_prev2curr, self.use_memory, track_query_info=None)
+            seg_preds, seg_feats = self.seg_decoder(bev_features=bev_feats, return_loss=False)
+            if not self.skip_vector_head:
+                preds_list = self.head(bev_feats, img_metas=img_metas, return_loss=False)
+            track_dict = None
+        else:
+            # Using the saved prev-frame output to prepare the track query inputs
+            track_query_info = self.head.get_track_info(scene_name, step)
+            # Transform prev-frame feature & pts to curr frame using the relative pose
+            self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev,
+                all_history_prev2curr, self.use_memory, track_query_info)
+            seg_preds, seg_feats = self.seg_decoder(bev_features=bev_feats, return_loss=False)
+
+            # Run the vector map decoder with instance-level memory
+            memory_bank = self.memory_bank if self.use_memory else None
+            preds_list = self.head(bev_feats, img_metas=img_metas,
+                        track_query_info=track_query_info, memory_bank=memory_bank,
+                        return_loss=False)
+            track_dict = self._process_track_query_info(track_query_info)
+
+        if not self.skip_vector_head:
+            # take predictions from the last layer
+            preds_dict = preds_list[-1]
+        else:
+            preds_dict = None
+
+        # Save the BEV and meta-info history
+        if self.temporal:
+            self.history_bev_feats_all.append(bev_feats)
+            self.history_img_metas_all.append(img_metas)
+
+            if len(self.history_bev_feats_all) > self.test_time_history_steps:
+                self.history_bev_feats_all.pop(0)
+                self.history_img_metas_all.pop(0)
+
+        pos_results = None
+        if not self.skip_vector_head:
+            memory_bank = self.memory_bank if self.use_memory else None
+            thr_det = 0.4 if first_frame else 0.6
+            pos_results = self.head.prepare_temporal_propagation(preds_dict, scene_name, step,
+                                        memory_bank, thr_track=0.5, thr_det=thr_det,
+                                        mem_seq_idx=img_metas[0]['local_idx'])
+
+        return {
+            'preds_dict': preds_dict,
+            'seg_preds': seg_preds,
+            'track_dict': track_dict,
+            'pos_results': pos_results,
+            'bev_refined': bev_feats,
+            'bev_basic': backbone_outs[2] if return_basic else None,
+        }
+
+    @torch.no_grad()
+    def forward_kd_teacher(self, img, img_metas, all_prev_data):
+        '''
+            AMap teacher: run the sequential inference over each training clip and return
+            the current-frame outputs. The clip is all_prev_data (ordered along the model's
+            time axis, i.e. the farthest future frame first for the future-aware teacher)
+            followed by the current frame.
+        Out:
+            bev_basic, bev_refined: (bs, C, bev_h, bev_w)
+            lines: List[(num_q_T, 2*num_points)], scores: List[(num_q_T, num_classes)] logits,
+                where num_q_T = num tracked queries + num_queries
+        '''
+        assert self.temporal and not self.training and not self.skip_vector_head
+        bs = img.shape[0]
+        teacher_outs = {'bev_basic': [], 'bev_refined': [], 'lines': [], 'scores': []}
+        for b_i in range(bs):
+            frames = [(prev_data['img'][b_i:b_i+1], [prev_data['img_metas'][b_i]]) for prev_data in all_prev_data]
+            frames.append((img[b_i:b_i+1], [img_metas[b_i]]))
+            for step, (img_t, img_metas_t) in enumerate(frames):
+                is_curr = step == len(frames) - 1
+                step_outs = self._test_step(img_t, img_metas_t, img_metas_t[0]['scene_name'], step,
+                                            return_basic=is_curr)
+            teacher_outs['bev_basic'].append(step_outs['bev_basic'][0])
+            teacher_outs['bev_refined'].append(step_outs['bev_refined'][0])
+            teacher_outs['lines'].append(step_outs['preds_dict']['lines'][0])
+            teacher_outs['scores'].append(step_outs['preds_dict']['scores'][0])
+        teacher_outs['bev_basic'] = torch.stack(teacher_outs['bev_basic'])
+        teacher_outs['bev_refined'] = torch.stack(teacher_outs['bev_refined'])
+        return teacher_outs
 
     def batch_data(self, vectors, imgs, img_metas, device, points=None):
         bs = len(vectors)

@@ -1,5 +1,5 @@
-av2
-nuscenes-devkit
+av2==0.2.1
+nuscenes-devkit==1.1.10
 einops==0.6.1
 numpy==1.23.5
 numba==0.53.0

@@ -156,8 +156,8 @@ class BEVFormerBackbone(nn.Module):
         
         return img_feats_reshaped
 
-    def forward(self, img, img_metas, timestep, history_bev_feats, history_img_metas, all_history_coord, *args, prev_bev=None, 
-                img_backbone_gradient=True, **kwargs):
+    def forward(self, img, img_metas, timestep, history_bev_feats, history_img_metas, all_history_coord, *args, prev_bev=None,
+                img_backbone_gradient=True, return_basic=False, **kwargs):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -222,11 +222,18 @@ class BEVFormerBackbone(nn.Module):
                 img_metas=img_metas,
                 prev_bev=prev_bev,
                 warped_history_bev=all_warped_history_feat,
+                return_basic=return_basic,
             )
-        
+        if return_basic:
+            outs, basic_outs = outs
+
         outs = outs.unflatten(1,(self.bev_h,self.bev_w)).permute(0,3,1,2).contiguous()
-        
+
         if self.upsample:
             outs = self.up(outs)
-        
+
+        if return_basic:
+            # the BEV before the memory fusion, (bs, C, bev_h, bev_w)
+            basic_outs = basic_outs.unflatten(1,(self.bev_h,self.bev_w)).permute(0,3,1,2).contiguous()
+            return outs, mlvl_feats, basic_outs
         return outs, mlvl_feats

@@ -71,7 +71,12 @@ class TemporalNet(nn.Module):
     
 
     def forward(self, history_feats, curr_feat):
-        input_feats = torch.cat([history_feats, curr_feat.unsqueeze(1)], dim=1)
+        if history_feats is None:
+            # current-frame only (history_steps=0)
+            assert self.history_steps == 0
+            input_feats = curr_feat.unsqueeze(1)
+        else:
+            input_feats = torch.cat([history_feats, curr_feat.unsqueeze(1)], dim=1)
         input_feats = rearrange(input_feats, 'b t c h w -> b (t c) h w') 
 
         out = self.conv_in(input_feats)

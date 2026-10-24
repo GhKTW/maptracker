@@ -36,14 +36,15 @@ class BEVFormerEncoder(TransformerLayerSequence):
     """
 
     def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
-                 **kwargs):
+                 mem_history_steps=4, **kwargs):
 
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
 
+        # mem_history_steps=0 gives a current-frame-only refinement layer (no BEV memory)
         temporal_mem_layers = []
         for _ in range(self.num_layers):
-            mem_conv = TemporalNet(history_steps=4, hidden_dims=self.embed_dims, num_blocks=1)
+            mem_conv = TemporalNet(history_steps=mem_history_steps, hidden_dims=self.embed_dims, num_blocks=1)
             temporal_mem_layers.append(mem_conv)
         self.temporal_mem_layers = nn.ModuleList(temporal_mem_layers)
 
@@ -168,8 +169,11 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 prev_bev=None,
                 shift=0.,
                 warped_history_bev=None,
+                return_basic=False,
                 **kwargs):
         """Forward function for `TransformerDecoder`.
+        If return_basic, also return the last layer's output before the BEV memory
+        fusion (the "basic" BEV of AMap), shape (bs, num_query, embed_dims).
         Args:
             bev_query (Tensor): Input BEV query with shape
                 `(num_query, bs, embed_dims)`.
@@ -238,9 +242,11 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 warped_history_bev=warped_history_bev,
                 **kwargs)
             
+            basic_output = output
+
             # BEV memory fusion layer
             mem_layer = self.temporal_mem_layers[lid]
-            curr_feat = rearrange(output, 'b (h w) c -> b c h w', h=warped_history_bev.shape[3])
+            curr_feat = rearrange(output, 'b (h w) c -> b c h w', h=bev_h)
             fused_output = mem_layer(warped_history_bev, curr_feat)
             fused_output = rearrange(fused_output, 'b c h w -> b (h w) c')
             output = output + fused_output
@@ -250,8 +256,10 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 intermediate.append(output)
 
         if self.return_intermediate:
-            return torch.stack(intermediate)
+            output = torch.stack(intermediate)
 
+        if return_basic:
+            return output, basic_output
         return output
 
 

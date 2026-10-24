@@ -1,0 +1,15 @@
+# MapTracker conda 환경 (H200 / sm_90) — torch, mmcv-full, mmdet3d 이후에 설치
+# 전체 설치 순서는 conda/install.sh 참고
+#
+# 버전 선택 이유
+# - H200(sm_90)은 CUDA 11.8 이상이 필요 → torch 1.9.0+cu111 은 사용 불가
+#   torch 2.0.1+cu118 (sm_90 포함, Python 3.8 지원)
+# - mmcv-full 1.6.0 은 torch 2.0 미지원 → 1.7.2 (sm_90 으로 소스 빌드)
+# - mmdet3d 1.0.0rc6 은 mmcv<=1.7.0 assert 가 있어 install.sh 에서 상한만 1.7.2 로 수정
+#   (rc6 은 CUDA op 이 전부 mmcv 로 이동해서 자체 빌드는 없음)
+
+mmdet==2.28.2
+mmsegmentation==0.30.0
+
+# MapTracker 기본 의존성 (numpy 1.23.5 / numba 0.53.0 / setuptools 59.5.0 고정)
+-r ../requirements.txt

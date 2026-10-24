@@ -706,8 +706,12 @@ class MapDetectorHead(nn.Module):
     
         return results
     
-    def prepare_temporal_propagation(self, preds_dict, scene_name, local_idx, memory_bank=None, 
-                        thr_track=0.1, thr_det=0.5):
+    def prepare_temporal_propagation(self, preds_dict, scene_name, local_idx, memory_bank=None,
+                        thr_track=0.1, thr_det=0.5, mem_seq_idx=None):
+        # mem_seq_idx: frame index stored in the vector memory for the relative time PE,
+        # defaults to local_idx (they differ only for clips of non-consecutive frames)
+        if mem_seq_idx is None:
+            mem_seq_idx = local_idx
         lines = preds_dict['lines'] # List[Tensor(num_queries, 2*num_points)]
         queries = preds_dict['hs_embeds']
         bs = len(lines)
@@ -767,7 +771,7 @@ class MapDetectorHead(nn.Module):
                 'hs_embeds': queries,
                 'scores': scores,
             }
-            memory_bank.update_memory(0, first_frame, pos_out_inds, prev_out, num_tracks, local_idx, memory_bank.curr_t)
+            memory_bank.update_memory(0, first_frame, pos_out_inds, prev_out, num_tracks, mem_seq_idx, memory_bank.curr_t)
             self.prop_active_tracks = len(pos_out_inds)
         
         save_pos_results = {

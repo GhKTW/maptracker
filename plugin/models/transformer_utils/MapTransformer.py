@@ -195,6 +195,8 @@ class MapTransformerLayer(BaseTransformerLayer):
             batch_first=batch_first,
             **kwargs
         )
+        # A single cross_attn means a current-frame-only layer without the vector memory attention
+        self.with_memory_attn = self.operation_order.count('cross_attn') == 2
 
     def forward(self,
                 query,
@@ -300,6 +302,9 @@ class MapTransformerLayer(BaseTransformerLayer):
                         key_padding_mask=key_padding_mask,
                         **kwargs)
                     attn_index += 1
+                    if not self.with_memory_attn:
+                        query = query_bev
+                        identity = query
                 else:
                     # Memory cross attention
                     assert attn_index == 2
