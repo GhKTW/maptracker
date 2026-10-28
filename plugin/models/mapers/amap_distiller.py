@@ -5,6 +5,8 @@
     - Asymmetric query distillation: Hungarian matching between the student queries and
       the teacher (tracked + new) queries, then KL on the classification logits
 """
+import os.path as osp
+
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
@@ -33,6 +35,7 @@ class AMapDistiller(BaseMapper):
                  logits_reduction='sum',
                  match_cls_weight=5.0,
                  match_reg_weight=50.0,
+                 teacher_cache=None,
                  **kwargs):
         """
         Args:
@@ -47,13 +50,20 @@ class AMapDistiller(BaseMapper):
                 or 'mean'
             match_cls_weight / match_reg_weight: Hungarian cost weights, same scale as the
                 MapTracker assigner (FocalLossCost 5.0 / LinesL1Cost 50.0)
+            teacher_cache: folder of the teacher outputs precomputed per sample token by
+                tools/amap_cache_teacher.py. The teacher is then not built and the train data
+                needs no clip.
         """
         super().__init__()
         teacher_file_cfg = Config.fromfile(teacher_config)
         self.student = build_model(student_cfg)
-        self.teacher = build_model(teacher_file_cfg.model)
         assert not self.student.temporal, 'the AMap student only sees the current frame'
-        assert self.teacher.temporal
+        self.teacher_cache = teacher_cache
+        if teacher_cache is None:
+            self.teacher = build_model(teacher_file_cfg.model)
+            assert self.teacher.temporal
+        else:
+            self.teacher = None
         self.teacher_ckpt = teacher_ckpt
 
         teacher_img_norm = teacher_file_cfg.img_norm_cfg
@@ -79,11 +89,16 @@ class AMapDistiller(BaseMapper):
     def init_weights(self, pretrained=None):
         self.student.init_weights()
         logger = get_root_logger()
+        if self.teacher is None:
+            logger.info(f'AMap teacher outputs read from {self.teacher_cache}')
+            return
         load_checkpoint(self.teacher, self.teacher_ckpt, map_location='cpu', strict=True, logger=logger)
         logger.info(f'AMap teacher loaded from {self.teacher_ckpt}')
         self._freeze_teacher()
 
     def _freeze_teacher(self):
+        if self.teacher is None:
+            return
         # MapTracker.train() toggles requires_grad of the BEV modules, freeze_bev keeps them off
         self.teacher.freeze_bev = True
         for param in self.teacher.parameters():
@@ -103,7 +118,8 @@ class AMapDistiller(BaseMapper):
     @num_iter.setter
     def num_iter(self, value):
         self.student.num_iter = value
-        self.teacher.num_iter = value
+        if self.teacher is not None:
+            self.teacher.num_iter = value
 
     def _renorm_for_teacher(self, img):
         """img: (..., 3, H, W) normalized with student_img_norm."""
@@ -119,13 +135,15 @@ class AMapDistiller(BaseMapper):
 
     def forward_train(self, img, vectors, semantic_mask, points=None, img_metas=None, all_prev_data=None,
                       all_local2global_info=None, **kwargs):
-        assert all_prev_data is not None, 'the teacher needs the temporal clip'
-
         # 1. frozen teacher: sequential inference over the clip, current-frame outputs
-        teacher_prev_data = [dict(prev_data, img=self._renorm_for_teacher(prev_data['img']))
-                             for prev_data in all_prev_data]
-        teacher_outs = self.teacher.forward_kd_teacher(self._renorm_for_teacher(img), img_metas,
-                                                       teacher_prev_data)
+        if self.teacher is None:
+            teacher_outs = self._load_teacher_cache(img_metas, img.device)
+        else:
+            assert all_prev_data is not None, 'the teacher needs the temporal clip'
+            teacher_prev_data = [dict(prev_data, img=self._renorm_for_teacher(prev_data['img']))
+                                 for prev_data in all_prev_data]
+            teacher_outs = self.teacher.forward_kd_teacher(self._renorm_for_teacher(img), img_metas,
+                                                           teacher_prev_data)
 
         # 2. student: current frame only, with its original MapTracker losses
         loss, log_vars, num_sample, student_outs = self.student.forward_train(
@@ -157,6 +175,16 @@ class AMapDistiller(BaseMapper):
         log_vars['total'] = loss.item()
 
         return loss, log_vars, num_sample
+
+    def _load_teacher_cache(self, img_metas, device):
+        """Same structure as MapTracker.forward_kd_teacher, the BEV features are stored in fp16."""
+        cached = [torch.load(osp.join(self.teacher_cache, f"{meta['token']}.pt"), map_location='cpu')
+                  for meta in img_metas]
+        teacher_outs = {k: torch.stack([c[k] for c in cached]).to(device).float()
+                        for k in ('bev_basic', 'bev_refined')}
+        for k in ('lines', 'scores'):
+            teacher_outs[k] = [c[k].to(device) for c in cached]
+        return teacher_outs
 
     def masked_feat_loss(self, feat_student, feat_teacher, mask=None):
         """Eq. 2: per-position L2 distance averaged over the masked positions.
