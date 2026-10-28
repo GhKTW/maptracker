@@ -21,10 +21,12 @@ def get_gts(dataset,new_split=False,N_WORKERS=16):
         dataset_name = 'av2'
     else:
         dataset_name = 'nusc'
+    # same per-annotation-file cache as plugin/datasets/evaluation/vector_eval.py
+    ann_name = os.path.splitext(os.path.basename(dataset.ann_file))[0]
     if new_split:
-        tmp_file = f'./tmp_gts_{dataset_name}_{roi_size[0]}x{roi_size[1]}_newsplit.pkl'
+        tmp_file = f'./tmp_gts_{dataset_name}_{roi_size[0]}x{roi_size[1]}_newsplit_{ann_name}.pkl'
     else:
-        tmp_file = f'./tmp_gts_{dataset_name}_{roi_size[0]}x{roi_size[1]}.pkl'
+        tmp_file = f'./tmp_gts_{dataset_name}_{roi_size[0]}x{roi_size[1]}_{ann_name}.pkl'
     if os.path.exists(tmp_file):
         print(f'loading cached gts from {tmp_file}')
         gts = mmcv.load(tmp_file)

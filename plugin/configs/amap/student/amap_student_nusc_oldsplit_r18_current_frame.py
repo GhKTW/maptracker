@@ -130,3 +130,9 @@ data = dict(
 
 # trained from ImageNet weights, not from the MapTracker stage 2 checkpoint
 load_from = None
+
+# half of the MapTracker stage 3 lr: stage 3 fine-tunes a pretrained model, and from
+# ImageNet weights 5e-4 makes the gradients explode right after the warmup (~iter 900,
+# with or without KD) and the model never recovers (KD run collapsed to 0.2 mAP).
+# 2.5e-4 and 1.25e-4 were both stable in 1800-iter runs, 2.5e-4 with the lower losses.
+optimizer = dict(lr=2.5e-4)

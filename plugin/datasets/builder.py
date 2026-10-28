@@ -20,6 +20,30 @@ from .samplers.distributed_sampler import DistributedSampler
 from .samplers.group_sampler import InfiniteGroupEachSampleInBatchSampler
 from .samplers.sampler import build_sampler
 
+
+class InfiniteEpochSampler:
+    """Chains the epochs of a sampler with `set_epoch` into one endless stream.
+
+    The index sequence is the same as calling `set_epoch(0), set_epoch(1), ...` between
+    epochs, but the DataLoader iterator never ends, so the workers keep prefetching
+    across the epoch boundary instead of the pipeline draining and refilling (~2.5 min
+    per epoch for the multi-frame clips on 8 GPUs).
+    """
+
+    def __init__(self, sampler):
+        self.sampler = sampler
+
+    def __iter__(self):
+        epoch = 0
+        while True:
+            self.sampler.set_epoch(epoch)
+            yield from iter(self.sampler)
+            epoch += 1
+
+    def __len__(self):
+        # length of one epoch, used for logging only
+        return len(self.sampler)
+
 def build_dataloader(dataset,
                      samples_per_gpu,
                      workers_per_gpu,
@@ -30,6 +54,7 @@ def build_dataloader(dataset,
                      shuffler_sampler=None,
                      nonshuffler_sampler=None,
                      runner_type=dict(type='EpochBasedRunner'),
+                     infinite_sampler=False,
                      **kwargs):
     """Build PyTorch DataLoader.
     In distributed training, each GPU/process has a dataloader.
@@ -98,6 +123,10 @@ def build_dataloader(dataset,
                                      )
         batch_size = 1 # Since we have batch sampler, the batch_size must = 1
         sampler = None
+
+    if infinite_sampler and sampler is not None:
+        assert hasattr(sampler, 'set_epoch'), 'the infinite sampler needs set_epoch'
+        sampler = InfiniteEpochSampler(sampler)
 
 
     init_fn = partial(

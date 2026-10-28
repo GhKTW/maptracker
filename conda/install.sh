@@ -48,6 +48,11 @@ pip install --no-build-isolation -e "${MMDET3D_DIR}"
 # requirements 에서 다시 끌려올 수 있는 버전 재고정
 pip install numpy==1.23.5 numba==0.53.0 "setuptools==59.5.0"
 
+# opencv-python(GUI 빌드)은 libxcb 등 X11 시스템 라이브러리가 필요 → headless 로 교체
+# (nuscenes-devkit 이 opencv-python 을 끌고 오므로 마지막에 교체)
+pip uninstall -y opencv-python opencv-python-headless || true
+pip install "opencv-python-headless<4.11"
+
 # 6) 확인: sm_90 및 mmcv CUDA op
 python - <<'EOF'
 import torch, mmcv, mmdet, mmseg, mmdet3d

@@ -924,7 +924,7 @@ class MapTracker(BaseMapper):
             not_prev_out_ind = torch.tensor([
                 ind.item()
                 for ind in not_prev_out_ind
-                if ind not in prev_out_ind and ind < pad_bound])
+                if ind not in prev_out_ind and ind < pad_bound], dtype=torch.long, device=device)
             
             # Get all non-matched pred with >0.5 conf score, serve as FP
             neg_scores = scores[not_prev_out_ind]

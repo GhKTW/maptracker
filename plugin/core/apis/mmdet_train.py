@@ -91,6 +91,7 @@ def custom_train_detector(model,
             shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
             nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
             runner_type=cfg.runner,
+            infinite_sampler=cfg.data.get('infinite_sampler', False),
         ) for ds in dataset
     ]
 
