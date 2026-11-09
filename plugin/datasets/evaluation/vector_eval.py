@@ -23,11 +23,17 @@ SAMPLE_DIST = 0.15
 # AMap A-mAP / R-mAP: the ROI is split at x=0 (x-axis = ego heading) into the ahead and
 # rear halves, map elements are clipped to each half and evaluated as the global mAP
 _HALF_PLANE = 1e4
+# distance bands (tools/eval_regions.py): each half split at |x| = 15 m (half of the 60 m ROI)
 REGION_BOXES = {
     'ahead': box(0, -_HALF_PLANE, _HALF_PLANE, _HALF_PLANE),
     'rear': box(-_HALF_PLANE, -_HALF_PLANE, 0, _HALF_PLANE),
+    'ahead_near': box(0, -_HALF_PLANE, 15, _HALF_PLANE),
+    'ahead_far': box(15, -_HALF_PLANE, _HALF_PLANE, _HALF_PLANE),
+    'rear_near': box(-15, -_HALF_PLANE, 0, _HALF_PLANE),
+    'rear_far': box(-_HALF_PLANE, -_HALF_PLANE, -15, _HALF_PLANE),
 }
-REGION_PREFIX = {None: '', 'ahead': 'A-', 'rear': 'R-'}
+REGION_PREFIX = {None: '', 'ahead': 'A-', 'rear': 'R-',
+                 'ahead_near': 'AN-', 'ahead_far': 'AF-', 'rear_near': 'RN-', 'rear_far': 'RF-'}
 
 
 def clip_vectors_to_region(vectors: List, region: str, scores: Optional[List]=None):
@@ -60,10 +66,13 @@ class VectorEvaluate(object):
         n_workers (int): num workers to parallel
     """
 
-    def __init__(self, dataset_cfg: Config, n_workers: int=N_WORKERS, eval_regions: bool=True) -> None:
+    def __init__(self, dataset_cfg: Config, n_workers: int=N_WORKERS, eval_regions: bool=True,
+                 regions: Optional[List]=None) -> None:
         self.dataset = build_dataset(dataset_cfg)
         # also report A-mAP / R-mAP (ahead / rear halves of the ROI)
         self.eval_regions = eval_regions
+        # regions to evaluate (None = whole ROI), overrides eval_regions
+        self.regions = regions
         self.cat2id = self.dataset.cat2id
         self.id2cat = {v: k for k, v in self.cat2id.items()}
         self.n_workers = n_workers
@@ -262,7 +271,10 @@ class VectorEvaluate(object):
         if self.n_workers > 0:
             pool = Pool(self.n_workers)
 
-        regions = [None, 'ahead', 'rear'] if self.eval_regions else [None]
+        if self.regions is not None:
+            regions = self.regions
+        else:
+            regions = [None, 'ahead', 'rear'] if self.eval_regions else [None]
         new_result_dict = {}
         for region in regions:
             result_dict = {}
@@ -345,6 +357,10 @@ class VectorEvaluate(object):
 
             for name in self.cat2id:
                 new_result_dict[prefix + name] = result_dict[name]['AP']
+                if self.regions is not None:
+                    # the per-threshold APs too (localization error analysis)
+                    for thr in self.thresholds:
+                        new_result_dict[f'{prefix}{name}@{thr}'] = result_dict[name][f'AP@{thr}']
             new_result_dict[prefix + 'mAP'] = mAP
 
         if self.n_workers > 0:

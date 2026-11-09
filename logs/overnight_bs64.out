@@ -1,0 +1,15 @@
+[2026-10-28 22:59:24] lr runs done
+[2026-10-28 22:59:24] FTKD teacher cache start
+[2026-10-28 23:23:12] FTKD teacher cache: 27968 files
+[2026-10-28 23:23:12] picked lr 7e-4
+END ftkd64_smoke
+Traceback (most recent call last):
+[2026-10-28 23:29:09] FTKD smoke: 1 error lines
+[2026-10-28 23:29:09] amap_kd_cached_bs64 start
+[2026-10-29 03:37:30] amap_kd_cached_bs64 end (rc 0): 2026-10-29 03:37:20,500 - mmdet - INFO - Iter(val) [760]	ped_crossing: 0.4126, divider: 0.4761, boundary: 0.4347, mAP: 0.4411, A-ped_crossing: 0.3541, A-divider: 0.5045, A-boundary: 0.4767, A-mAP: 0.4451, R-ped_crossing: 0.2916, R-divider: 0.4937, R-boundary: 0.4873, R-mAP: 0.4242
+[2026-10-29 03:37:30] amap_student_bs64 start
+[2026-10-29 07:24:00] amap_student_bs64 end (rc 0): 2026-10-29 07:23:54,134 - mmdet - INFO - Iter(val) [760]	ped_crossing: 0.5218, divider: 0.5640, boundary: 0.5104, mAP: 0.5320, A-ped_crossing: 0.4477, A-divider: 0.5770, A-boundary: 0.5487, A-mAP: 0.5245, R-ped_crossing: 0.3686, R-divider: 0.5814, R-boundary: 0.5393, R-mAP: 0.4964
+[2026-10-29 07:24:00] ftkd_cached_bs64 start
+[2026-10-29 11:35:12] ftkd_cached_bs64 end (rc 0): 2026-10-29 11:35:04,880 - mmdet - INFO - Iter(val) [760]	ped_crossing: 0.5196, divider: 0.5639, boundary: 0.5349, mAP: 0.5395, A-ped_crossing: 0.4430, A-divider: 0.5733, A-boundary: 0.5566, A-mAP: 0.5243, R-ped_crossing: 0.3493, R-divider: 0.5749, R-boundary: 0.5753, R-mAP: 0.4998
+[2026-10-29 11:35:12] FTKD mAP=0.5395 hour=11
+[2026-10-29 11:35:12] queue done

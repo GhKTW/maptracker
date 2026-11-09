@@ -257,10 +257,10 @@ class MapDetectorHead(nn.Module):
 
             pred_dict = {
                 'lines': reg_points_list,
-                'scores': scores_list
+                'scores': scores_list,
+                # also read by the FTKD query reconstruction
+                'hs_embeds': queries,
             }
-            if return_matching:
-                pred_dict['hs_embeds'] = queries
             outputs.append(pred_dict)
 
         # Pass in the track query information to massage the cost matrix

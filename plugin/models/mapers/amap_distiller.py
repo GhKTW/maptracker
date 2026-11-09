@@ -182,8 +182,9 @@ class AMapDistiller(BaseMapper):
                   for meta in img_metas]
         teacher_outs = {k: torch.stack([c[k] for c in cached]).to(device).float()
                         for k in ('bev_basic', 'bev_refined')}
-        for k in ('lines', 'scores'):
-            teacher_outs[k] = [c[k].to(device) for c in cached]
+        for k in ('lines', 'scores', 'hs_embeds'):
+            if k in cached[0]:
+                teacher_outs[k] = [c[k].to(device).float() for c in cached]
         return teacher_outs
 
     def masked_feat_loss(self, feat_student, feat_teacher, mask=None):

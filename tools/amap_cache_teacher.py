@@ -78,6 +78,7 @@ def main():
                 'bev_refined': outs['bev_refined'][b_i].half().cpu().clone(),
                 'lines': outs['lines'][b_i].float().cpu().clone(),
                 'scores': outs['scores'][b_i].float().cpu().clone(),
+                'hs_embeds': outs['hs_embeds'][b_i].half().cpu().clone(),
             }, path + '.tmp')
             os.replace(path + '.tmp', path)
         if rank == 0 and (it + 1) % 50 == 0:

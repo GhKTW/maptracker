@@ -42,11 +42,15 @@ class MapTracker(BaseMapper):
                  mem_len=None,
                  mem_warmup_iters=-1,
                  temporal=True,
+                 test_current_only=False,
                  **kwargs):
         super().__init__()
         # temporal=False: current-frame-only model (AMap student), no BEV memory,
         # no track query propagation and no vector memory at both training and test time
         self.temporal = temporal
+        # test_current_only: a temporal model evaluated without any memory (every frame is
+        # the first one of its sequence), e.g. the future teacher reduced to the current frame
+        self.test_current_only = test_current_only
         if not temporal:
             assert not use_memory and not history_steps, \
                 'a current-frame-only model must not use history_steps / use_memory'
@@ -93,6 +97,9 @@ class MapTracker(BaseMapper):
         else:
             self.test_time_history_steps = test_time_history_steps
         self.mem_select_dist_ranges = mem_select_dist_ranges
+
+        # optional callable on the current-frame BEV after the neck (set by FMKDDistiller)
+        self.bev_refine_fn = None
 
         # vector instance memory module
         if self.use_memory:
@@ -524,6 +531,8 @@ class MapTracker(BaseMapper):
         _bev_feats, mlvl_feats = backbone_outs[:2]
         # Neck for curr
         bev_feats = self.neck(_bev_feats)
+        if self.bev_refine_fn is not None:
+            bev_feats = self.bev_refine_fn(bev_feats)
 
         if self.skip_vector_head or num_prev_frames == 0:
             # Transform prev-frame feature & pts to curr frame using the relative pose
@@ -602,6 +611,7 @@ class MapTracker(BaseMapper):
                 'bev_refined': bev_feats,
                 'lines': preds_list[-1]['lines'], # List[(num_q, 2*num_points)], normalized
                 'scores': preds_list[-1]['scores'], # List[(num_q, num_classes)], logits
+                'hs_embeds': preds_list[-1]['hs_embeds'], # (bs, num_q, embed_dims)
             }
             return loss, log_vars, num_sample, kd_outputs
         return loss, log_vars, num_sample
@@ -622,7 +632,7 @@ class MapTracker(BaseMapper):
         img_metas[0]['local_idx'] = local_idx
 
         # a current-frame-only model treats every frame as the first frame of a sequence
-        step = local_idx if self.temporal else 0
+        step = local_idx if (self.temporal and not self.test_current_only) else 0
         step_outs = self._test_step(img, img_metas, scene_name, step, points=points)
         preds_dict = step_outs['preds_dict']
         seg_preds = step_outs['seg_preds']
@@ -689,6 +699,8 @@ class MapTracker(BaseMapper):
 
         # Neck
         bev_feats = self.neck(_bev_feats)
+        if self.bev_refine_fn is not None:
+            bev_feats = self.bev_refine_fn(bev_feats)
 
         if self.skip_vector_head or first_frame:
             self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, \
@@ -754,11 +766,12 @@ class MapTracker(BaseMapper):
         Out:
             bev_basic, bev_refined: (bs, C, bev_h, bev_w)
             lines: List[(num_q_T, 2*num_points)], scores: List[(num_q_T, num_classes)] logits,
+                hs_embeds: List[(num_q_T, embed_dims)] last decoder layer query features,
                 where num_q_T = num tracked queries + num_queries
         '''
         assert self.temporal and not self.training and not self.skip_vector_head
         bs = img.shape[0]
-        teacher_outs = {'bev_basic': [], 'bev_refined': [], 'lines': [], 'scores': []}
+        teacher_outs = {'bev_basic': [], 'bev_refined': [], 'lines': [], 'scores': [], 'hs_embeds': []}
         for b_i in range(bs):
             frames = [(prev_data['img'][b_i:b_i+1], [prev_data['img_metas'][b_i]]) for prev_data in all_prev_data]
             frames.append((img[b_i:b_i+1], [img_metas[b_i]]))
@@ -770,6 +783,7 @@ class MapTracker(BaseMapper):
             teacher_outs['bev_refined'].append(step_outs['bev_refined'][0])
             teacher_outs['lines'].append(step_outs['preds_dict']['lines'][0])
             teacher_outs['scores'].append(step_outs['preds_dict']['scores'][0])
+            teacher_outs['hs_embeds'].append(step_outs['preds_dict']['hs_embeds'][0])
         teacher_outs['bev_basic'] = torch.stack(teacher_outs['bev_basic'])
         teacher_outs['bev_refined'] = torch.stack(teacher_outs['bev_refined'])
         return teacher_outs
