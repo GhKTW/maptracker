@@ -23,6 +23,28 @@ ext_module = ext_loader.load_ext(
     '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
 
+class BEVRefineLN(nn.Module):
+    """11-13 seam fix B: ConvNeXt-style block on the BEV grid, residual inside a LayerNorm.
+    Depthwise kxk mixes neighbouring cells (what the removed block did spatially), the output keeps the
+    per-cell LayerNorm scale (no unnormalized ReLU residual -> no per-cell scale shortcut)."""
+    def __init__(self, dims=256, kernel=5, expand=2):
+        super().__init__()
+        self.dw = nn.Conv2d(dims, dims, kernel, padding=kernel // 2, groups=dims)
+        self.pw1 = nn.Conv2d(dims, dims * expand, 1)
+        self.act = nn.GELU()
+        self.pw2 = nn.Conv2d(dims * expand, dims, 1)
+        self.norm = nn.LayerNorm(dims)
+        self.reset_seam_params()
+
+    def reset_seam_params(self):
+        nn.init.zeros_(self.pw2.weight); nn.init.zeros_(self.pw2.bias)
+
+    def forward(self, x, bev_h):  # x (bs, H*W, C)
+        y = rearrange(x, 'b (h w) c -> b c h w', h=bev_h)
+        y = self.pw2(self.act(self.pw1(self.dw(y))))
+        return self.norm(x + rearrange(y, 'b c h w -> b (h w) c'))
+
+
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class BEVFormerEncoder(TransformerLayerSequence):
 
@@ -36,17 +58,53 @@ class BEVFormerEncoder(TransformerLayerSequence):
     """
 
     def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
-                 mem_history_steps=4, **kwargs):
+                 mem_history_steps=4, use_mem_layer=True, sca_cam_weight=False, bev_refine=None,
+                 batch_safe=False, **kwargs):
 
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
         self.return_intermediate = return_intermediate
 
+        # 11-14: upstream TSA / SCA are exact only for one sample per GPU (see the comments there); with
+        # batch_safe every sample of a batch gets the BEV it would get alone. bs == 1 results are unchanged.
+        if batch_safe:
+            from .spatial_cross_attention import SpatialCrossAttention
+            from .temporal_self_attention import TemporalSelfAttention
+            n = 0
+            for layer in self.layers:
+                for attn in layer.attentions:
+                    if isinstance(attn, (SpatialCrossAttention, TemporalSelfAttention)):
+                        attn.batch_safe = True; n += 1
+            assert n == 2 * self.num_layers, n
+
         # mem_history_steps=0 gives a current-frame-only refinement layer (no BEV memory)
-        temporal_mem_layers = []
-        for _ in range(self.num_layers):
-            mem_conv = TemporalNet(history_steps=mem_history_steps, hidden_dims=self.embed_dims, num_blocks=1)
-            temporal_mem_layers.append(mem_conv)
-        self.temporal_mem_layers = nn.ModuleList(temporal_mem_layers)
+        # use_mem_layer=False (11-12): no BEV memory fusion block at all, each encoder layer outputs
+        # its LayerNorm'd transformer output directly (only for current-frame models)
+        assert use_mem_layer or mem_history_steps == 0, 'use_mem_layer=False needs mem_history_steps=0'
+        self.use_mem_layer = use_mem_layer
+        if use_mem_layer:
+            temporal_mem_layers = []
+            for _ in range(self.num_layers):
+                mem_conv = TemporalNet(history_steps=mem_history_steps, hidden_dims=self.embed_dims, num_blocks=1)
+                temporal_mem_layers.append(mem_conv)
+            self.temporal_mem_layers = nn.ModuleList(temporal_mem_layers)
+        else:
+            self.temporal_mem_layers = None
+
+        # 11-13 seam fix A: learned per-camera weights in every spatial cross-attention
+        if sca_cam_weight:
+            from .spatial_cross_attention import SpatialCrossAttention
+            n = 0
+            for layer in self.layers:
+                for attn in layer.attentions:
+                    if isinstance(attn, SpatialCrossAttention):
+                        attn.enable_cam_weight(); n += 1
+            assert n == self.num_layers, n
+        # 11-13 seam fix B: light spatial refinement that keeps the LayerNorm'd scale
+        #   Y = LN(Q + PW2(GELU(PW1(DW_k(Q))))), PW2 zero-init, no ReLU at the end
+        self.bev_refine = None
+        if bev_refine is not None:
+            assert not use_mem_layer, 'bev_refine replaces the memory-fusion block'
+            self.bev_refine = nn.ModuleList([BEVRefineLN(self.embed_dims, **bev_refine) for _ in range(self.num_layers)])
 
         self.num_points_in_pillar = num_points_in_pillar
         self.pc_range = pc_range
@@ -245,11 +303,14 @@ class BEVFormerEncoder(TransformerLayerSequence):
             basic_output = output
 
             # BEV memory fusion layer
-            mem_layer = self.temporal_mem_layers[lid]
-            curr_feat = rearrange(output, 'b (h w) c -> b c h w', h=bev_h)
-            fused_output = mem_layer(warped_history_bev, curr_feat)
-            fused_output = rearrange(fused_output, 'b c h w -> b (h w) c')
-            output = output + fused_output
+            if self.use_mem_layer:
+                mem_layer = self.temporal_mem_layers[lid]
+                curr_feat = rearrange(output, 'b (h w) c -> b c h w', h=bev_h)
+                fused_output = mem_layer(warped_history_bev, curr_feat)
+                fused_output = rearrange(fused_output, 'b c h w -> b (h w) c')
+                output = output + fused_output
+            if self.bev_refine is not None:
+                output = self.bev_refine[lid](output, bev_h)
 
             bev_query = output
             if self.return_intermediate:

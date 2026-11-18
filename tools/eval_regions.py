@@ -23,12 +23,17 @@ def main():
     parser.add_argument('out', help='output json, results keyed by run name (merged if it exists)')
     parser.add_argument('runs', nargs='+', help='run names under work_dirs/ or paths to submission files')
     parser.add_argument('--workers', type=int, default=16)
+    parser.add_argument('--regions', default='all',
+                        help="'all' (7 regions), 'half' (whole ROI, ahead, rear) or 'ar' (ahead, rear only)")
+    parser.add_argument('--ped-line', action='store_true', help='pre-11-12 clipping of ped crossings as lines')
     args = parser.parse_args()
 
     cfg = Config.fromfile(args.config)
     import plugin  # noqa: F401, registers the datasets
     from plugin.datasets.evaluation.vector_eval import VectorEvaluate
-    evaluator = VectorEvaluate(cfg.data.test.eval_config, n_workers=args.workers, regions=REGIONS)
+    regions = {'all': REGIONS, 'half': [None, 'ahead', 'rear'], 'ar': ['ahead', 'rear']}[args.regions]
+    evaluator = VectorEvaluate(cfg.data.test.eval_config, n_workers=args.workers, regions=regions,
+                               ped_as_polygon=not args.ped_line)
 
     results = json.load(open(args.out)) if os.path.exists(args.out) else {}
     for run in args.runs:

@@ -526,13 +526,18 @@ class MapTracker(BaseMapper):
 
         all_history_curr2prev, all_history_prev2curr, all_history_coord = self.process_history_info(img_metas, history_img_metas)
 
-        backbone_outs = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
-                    points=None, img_backbone_gradient=img_backbone_gradient, return_basic=return_kd_outputs)
-        _bev_feats, mlvl_feats = backbone_outs[:2]
-        # Neck for curr
-        bev_feats = self.neck(_bev_feats)
-        if self.bev_refine_fn is not None:
-            bev_feats = self.bev_refine_fn(bev_feats)
+        if getattr(self, 'bev_override', None) is not None:
+            # 11-15 oracle diagnosis: a given (cached teacher) head-input BEV replaces image backbone + BEV encoder
+            bev_feats = self.bev_override
+            backbone_outs = (None, None, None)
+        else:
+            backbone_outs = self.backbone(img, img_metas, num_prev_frames, history_bev_feats, history_img_metas, all_history_coord,
+                        points=None, img_backbone_gradient=img_backbone_gradient, return_basic=return_kd_outputs)
+            _bev_feats, mlvl_feats = backbone_outs[:2]
+            # Neck for curr
+            bev_feats = self.neck(_bev_feats)
+            if self.bev_refine_fn is not None:
+                bev_feats = self.bev_refine_fn(bev_feats)
 
         if self.skip_vector_head or num_prev_frames == 0:
             # Transform prev-frame feature & pts to curr frame using the relative pose
@@ -605,13 +610,15 @@ class MapTracker(BaseMapper):
         num_sample = img.size(0)
 
         if return_kd_outputs:
-            assert not self.skip_vector_head
+            # skip_vector_head (stage-1 BEV pretraining): only the BEV outputs exist
+            last = None if self.skip_vector_head else preds_list[-1]
             kd_outputs = {
                 'bev_basic': backbone_outs[2],
                 'bev_refined': bev_feats,
-                'lines': preds_list[-1]['lines'], # List[(num_q, 2*num_points)], normalized
-                'scores': preds_list[-1]['scores'], # List[(num_q, num_classes)], logits
-                'hs_embeds': preds_list[-1]['hs_embeds'], # (bs, num_q, embed_dims)
+                'lines': last and last['lines'], # List[(num_q, 2*num_points)], normalized
+                'scores': last and last['scores'], # List[(num_q, num_classes)], logits
+                'hs_embeds': last and last['hs_embeds'], # (bs, num_q, embed_dims)
+                'seg_preds': seg_preds, # (bs, num_classes, 200, 100) sigmoid logits of the current frame
             }
             return loss, log_vars, num_sample, kd_outputs
         return loss, log_vars, num_sample
@@ -693,14 +700,18 @@ class MapTracker(BaseMapper):
         all_history_curr2prev, all_history_prev2curr, all_history_coord =  \
                     self.process_history_info(img_metas, history_img_metas)
 
-        backbone_outs = self.backbone(img, img_metas, step, history_bev_feats, history_img_metas,
-                        all_history_coord, points=points, return_basic=return_basic)
-        _bev_feats = backbone_outs[0]
+        if getattr(self, 'bev_override', None) is not None:
+            bev_feats = self.bev_override   # 11-15 oracle diagnosis, see forward_train
+            backbone_outs = (None, None, None)
+        else:
+            backbone_outs = self.backbone(img, img_metas, step, history_bev_feats, history_img_metas,
+                            all_history_coord, points=points, return_basic=return_basic)
+            _bev_feats = backbone_outs[0]
 
-        # Neck
-        bev_feats = self.neck(_bev_feats)
-        if self.bev_refine_fn is not None:
-            bev_feats = self.bev_refine_fn(bev_feats)
+            # Neck
+            bev_feats = self.neck(_bev_feats)
+            if self.bev_refine_fn is not None:
+                bev_feats = self.bev_refine_fn(bev_feats)
 
         if self.skip_vector_head or first_frame:
             self.temporal_propagate(bev_feats, img_metas, all_history_curr2prev, \

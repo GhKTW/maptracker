@@ -7,7 +7,7 @@ from .AP import instance_match, average_precision
 import prettytable
 from time import time
 from functools import cached_property
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Polygon, box
 from numpy.typing import NDArray
 from typing import Dict, List, Optional
 from logging import Logger
@@ -36,8 +36,32 @@ REGION_PREFIX = {None: '', 'ahead': 'A-', 'rear': 'R-',
                  'ahead_near': 'AN-', 'ahead_far': 'AF-', 'rear_near': 'RN-', 'rear_far': 'RF-'}
 
 
-def clip_vectors_to_region(vectors: List, region: str, scores: Optional[List]=None):
+def _clip_polygon(vector: NDArray, region_box):
+    ''' Clip a pedestrian crossing as an area: close the ring (predictions leave a small gap),
+    intersect the polygon with the region and return the exterior ring of every piece (closed,
+    including the new edge on the border). None if the ring has no area (then clip it as a line).
+    '''
+    if len(vector) < 3:
+        return None
+    poly = Polygon(vector)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty or poly.area < 1e-4:
+        return None
+    clipped = poly.intersection(region_box)
+    pieces = getattr(clipped, 'geoms', [clipped])
+    return [np.array(p.exterior.coords) for p in pieces
+            if p.geom_type == 'Polygon' and not p.is_empty and p.area > 0]
+
+
+def clip_vectors_to_region(vectors: List, region: str, scores: Optional[List]=None,
+                           as_polygon: bool=False):
     ''' Clip polylines to a half region, a polyline crossing the border may give several pieces.
+
+    as_polygon (11-12 fix, pedestrian crossings): clip the closed ring as a polygon. Clipping a ring
+    as an open line made the pieces depend on where the ring starts (a crossing whose start vertex
+    lies inside the half gave two pieces, otherwise one), so G.T. and prediction pieces did not
+    correspond and A-ped / R-ped were ~10 AP below the whole-ROI ped AP.
 
     Returns:
         clipped_vectors (List[NDArray]), clipped_scores (List[float] or None)
@@ -47,6 +71,12 @@ def clip_vectors_to_region(vectors: List, region: str, scores: Optional[List]=No
     for i, vector in enumerate(vectors):
         vector = np.array(vector)
         if len(vector) < 2:
+            continue
+        rings = _clip_polygon(vector, region_box) if as_polygon else None
+        if rings is not None:
+            clipped_vectors.extend(rings)
+            if scores is not None:
+                clipped_scores.extend([scores[i]] * len(rings))
             continue
         clipped = LineString(vector).intersection(region_box)
         pieces = getattr(clipped, 'geoms', [clipped])
@@ -67,12 +97,14 @@ class VectorEvaluate(object):
     """
 
     def __init__(self, dataset_cfg: Config, n_workers: int=N_WORKERS, eval_regions: bool=True,
-                 regions: Optional[List]=None) -> None:
+                 regions: Optional[List]=None, ped_as_polygon: bool=True) -> None:
         self.dataset = build_dataset(dataset_cfg)
         # also report A-mAP / R-mAP (ahead / rear halves of the ROI)
         self.eval_regions = eval_regions
         # regions to evaluate (None = whole ROI), overrides eval_regions
         self.regions = regions
+        # half-region clipping of pedestrian crossings as polygons (False = the pre-11-12 line clipping)
+        self.ped_as_polygon = ped_as_polygon
         self.cat2id = self.dataset.cat2id
         self.id2cat = {v: k for k, v in self.cat2id.items()}
         self.n_workers = n_workers
@@ -165,7 +197,8 @@ class VectorEvaluate(object):
                          groundtruth: List, 
                          thresholds: List,
                          metric: str='metric',
-                         region: Optional[str]=None) -> Dict[int, NDArray]:
+                         region: Optional[str]=None,
+                         as_polygon: bool=False) -> Dict[int, NDArray]:
         ''' Do single-frame matching for one class.
 
         Args:
@@ -180,8 +213,8 @@ class VectorEvaluate(object):
                 e.g. {0.5: (M, 2), 1.0: (M, 2), 1.5: (M, 2)}
         '''
         if region is not None:
-            pred_vectors, scores = clip_vectors_to_region(pred_vectors, region, scores)
-            groundtruth, _ = clip_vectors_to_region(groundtruth, region)
+            pred_vectors, scores = clip_vectors_to_region(pred_vectors, region, scores, as_polygon)
+            groundtruth, _ = clip_vectors_to_region(groundtruth, region, as_polygon=as_polygon)
 
         pred_lines = []
 
@@ -289,7 +322,9 @@ class VectorEvaluate(object):
                 samples = samples_by_cls[label] # List[(pred_lines, scores, gts)]
                 sum_AP = 0
 
-                fn = partial(self._evaluate_single, thresholds=self.thresholds, metric=metric, region=region)
+                as_polygon = self.ped_as_polygon and self.id2cat[label] == 'ped_crossing'
+                fn = partial(self._evaluate_single, thresholds=self.thresholds, metric=metric, region=region,
+                             as_polygon=as_polygon)
                 if self.n_workers > 0:
                     tpfp_score_list = pool.starmap(fn, samples)
                 else:

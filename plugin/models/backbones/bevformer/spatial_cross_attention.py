@@ -6,6 +6,7 @@
 # ---------------------------------------------
 
 from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
+import math
 import warnings
 import torch
 import torch.nn as nn
@@ -65,11 +66,42 @@ class SpatialCrossAttention(BaseModule):
         self.num_cams = num_cams
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.batch_first = batch_first
+        self.cam_weight = False
         self.init_weight()
 
     def init_weight(self):
         """Default initialization for Parameters of Module."""
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
+
+    def enable_cam_weight(self, hidden=16):
+        """11-13 seam fix A: replace the plain average over the cameras that see a BEV cell
+        (slots / count) by a learned softmax weight over those cameras.
+        logit(cell p, cam i) = W_q q_p [i] + g(u_i, v_i, edge_i, vis_i)
+          q_p: the BEV query (+pos), u/v: mean normalized image coords of the visible pillar points in cam i,
+          edge: their distance to the nearest image border, vis: fraction of the 4 pillar points visible.
+        Last layers are zero -> uniform weights over the visible cameras = the original average at init."""
+        self.cam_weight = True
+        self.cam_q = nn.Linear(self.embed_dims, self.num_cams)
+        self.cam_geo = nn.Sequential(nn.Linear(4, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, 1))
+        self.reset_seam_params()
+
+    def reset_seam_params(self):
+        if self.cam_weight:
+            nn.init.zeros_(self.cam_q.weight); nn.init.zeros_(self.cam_q.bias)
+            nn.init.zeros_(self.cam_geo[2].weight); nn.init.zeros_(self.cam_geo[2].bias)
+
+    def _cam_weights(self, query, reference_points_cam, bev_mask):
+        """query (bs, Q, C); reference_points_cam (cams, bs, Q, D, 2) in [0,1]; bev_mask (cams, bs, Q, D)
+        -> weights (cams, bs, Q), summing to 1 over the visible cameras (0 where no camera sees the cell)"""
+        m = bev_mask.float()
+        vis = m.sum(-1)                                                  # (cams, bs, Q)
+        seen = vis > 0
+        uv = (reference_points_cam * m[..., None]).sum(-2) / vis.clamp(min=1)[..., None]
+        edge = torch.minimum(uv, 1 - uv).min(-1)[0].clamp(min=0)
+        geo = torch.stack([uv[..., 0], uv[..., 1], edge, vis / m.shape[-1]], -1)
+        logit = self.cam_geo(geo).squeeze(-1) + self.cam_q(query).permute(2, 0, 1)
+        logit = logit.masked_fill(~seen, -1e4)
+        return torch.softmax(logit, 0) * seen.float()
     
     @force_fp32(apply_to=('query', 'key', 'value', 'query_pos', 'reference_points_cam'))
     def forward(self,
@@ -134,8 +166,15 @@ class SpatialCrossAttention(BaseModule):
 
         D = reference_points_cam.size(3)
         indexes = []
+        # upstream takes the cells of every camera from sample 0 of the batch (exact only for bs == 1): for the
+        # other samples a cell on a camera-visibility boundary can lose a camera that still enters `count`.
+        # batch_safe (11-14): index = union over the batch, contributions masked per sample below.
+        batch_safe = getattr(self, 'batch_safe', False)
         for i, mask_per_img in enumerate(bev_mask):
-            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
+            if batch_safe:
+                index_query_per_img = mask_per_img.sum(-1).sum(0).nonzero().squeeze(-1)
+            else:
+                index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
             indexes.append(index_query_per_img)
         max_len = max([len(each) for each in indexes])
 
@@ -161,9 +200,21 @@ class SpatialCrossAttention(BaseModule):
         queries = self.deformable_attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
                                             reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
                                             level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
+        if self.cam_weight:
+            w = self._cam_weights(query, reference_points_cam, bev_mask)   # (cams, bs, Q)
+            for j in range(bs):
+                for i, index_query_per_img in enumerate(indexes):
+                    slots[j, index_query_per_img] += w[i, j, index_query_per_img, None] * \
+                        queries[j, i, :len(index_query_per_img)]
+            slots = self.output_proj(slots)
+            return self.dropout(slots) + inp_residual
+
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
-                slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
+                q = queries[j, i, :len(index_query_per_img)]
+                if batch_safe:  # only the cells this sample really sees in camera i
+                    q = q * (bev_mask[i, j, index_query_per_img].sum(-1) > 0)[:, None].to(q.dtype)
+                slots[j, index_query_per_img] += q
 
         count = bev_mask.sum(-1) > 0
         count = count.permute(1, 2, 0).sum(-1)
@@ -388,7 +439,7 @@ class MSDeformableAttention3D(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                attention_weights, math.gcd(value.shape[0], self.im2col_step))  # 11-15: any per-GPU batch (bs*6 cams)
         else:
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)
@@ -615,7 +666,7 @@ class MSIPM3D(BaseModule):
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
+                attention_weights, math.gcd(value.shape[0], self.im2col_step))  # 11-15: any per-GPU batch (bs*6 cams)
         else:
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights)

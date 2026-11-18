@@ -44,6 +44,9 @@ def main():
     parser.add_argument('--student-ckpt', required=True)
     parser.add_argument('--samples-per-gpu', type=int, default=2)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--val', action='store_true',
+                        help='11-15: cache the val tokens instead (train clip sampling on the val ann file, '
+                             'no photometric augmentation), for the oracle-BEV diagnosis')
     args = parser.parse_args()
 
     cfg = Config.fromfile(args.config)
@@ -64,6 +67,10 @@ def main():
     student.eval()
     assert not student.temporal
 
+    if args.val:
+        cfg.data.train.ann_file = cfg.data.val.ann_file
+        cfg.data.train.pipeline = [t for t in cfg.data.train.pipeline
+                                   if t['type'] != 'PhotoMetricDistortionMultiViewImage']
     dataset = build_dataset(cfg.data.train)
     indices = [i for i in range(rank, len(dataset), world_size)
                if not osp.exists(osp.join(args.out_dir, f'{dataset.idx2token[i]}.pt'))]

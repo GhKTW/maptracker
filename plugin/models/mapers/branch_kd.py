@@ -27,6 +27,18 @@ from .base_mapper import MAPPERS
 from .labelkd_distiller import LabelKDDistiller
 
 
+class _GradScale(torch.autograd.Function):
+    """identity forward, gradient multiplied by `scale` backward"""
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g * ctx.scale, None
+
+
 class ResBlock(nn.Module):
 
     def __init__(self, channels, dilation=1, zero_init=True):
@@ -101,6 +113,9 @@ class BranchKDDistiller(AMapDistiller):
                  boundary_label=2,
                  eval_fut_off=False,
                  log_fut_split=False,
+                 freeze_predictor=False,
+                 fut_grad_scale=1.0,
+                 kd_proj=False,
                  **kwargs):
         kwargs.setdefault('loss_feat_basic_weight', 0.0)
         kwargs.setdefault('loss_feat_refined_weight', 0.0)
@@ -127,6 +142,21 @@ class BranchKDDistiller(AMapDistiller):
         #   |B_fut - Delta|^2 = |B_fut - mu|^2 (predictable part) + |Delta - mu|^2 (floor) + cross term
         self.log_fut_split = log_fut_split
         self._split = None
+        # staged training, stage 2 (decoder warmup): the predictor is part of the frozen BEV module
+        self.freeze_predictor = freeze_predictor
+        # 11-11: scale the gradient that reaches the future branch through `fused` (L_map, seg, SMG,
+        # logit KD) by this factor; the branch's own KD on B_fut keeps the full gradient. 1.0 = off.
+        self.fut_grad_scale = fut_grad_scale
+        # 11-12: feature KD through a training-only 1x1 projector A(x) = W x + b (identity init), so the
+        # head-input BEV is not forced into the teacher's feature space. One linear map for every term:
+        #   cur: MSE(A(B_cur), F_Tcur)   fut: target vs W B_fut (no bias)   SMG: InfoNCE(A(fused), F_T)
+        # => A(fused) = A(B_cur) + W B_fut approximates F_Tcur + mu, consistently. Unused at test time.
+        self.kd_proj = None
+        if kd_proj:
+            self.kd_proj = nn.Conv2d(256, 256, 1)
+            with torch.no_grad():
+                self.kd_proj.weight.copy_(torch.eye(256).view(256, 256, 1, 1))
+                self.kd_proj.bias.zero_()
 
         if branch:
             self.predictor = FuturePredictor(256, pred_hidden)
@@ -148,6 +178,10 @@ class BranchKDDistiller(AMapDistiller):
         super().train(mode)
         if self.probe is not None:
             self.probe.eval()
+        if self.freeze_predictor and self.branch:
+            self.predictor.eval()
+            for p in self.predictor.parameters():
+                p.requires_grad = False
         return self
 
     def fuse_bev(self, bev):
@@ -156,6 +190,8 @@ class BranchKDDistiller(AMapDistiller):
         self._b_fut = b_fut
         if not self.training and self.eval_fut_off:
             return bev
+        if self.training and self.fut_grad_scale != 1.0:
+            return bev + _GradScale.apply(b_fut, self.fut_grad_scale)
         return bev + b_fut
 
     def _load_teacher_cache(self, img_metas, device):
@@ -215,18 +251,29 @@ class BranchKDDistiller(AMapDistiller):
                 img, vectors, semantic_mask, points=points, img_metas=img_metas, return_kd_outputs=True)
             fused = s['bev_refined']
             b_cur = self._b_cur if self.branch else fused
+            b_fut = self._b_fut
+            if self.kd_proj is not None:
+                fused = self.kd_proj(fused)
+                b_cur = self.kd_proj(b_cur)
+                if self.branch:
+                    b_fut = F.conv2d(b_fut, self.kd_proj.weight)
 
             kd = {}
             if self.loss_cur_weight > 0:
                 kd['bkd_cur'] = self.loss_cur_weight * F.mse_loss(b_cur, t['cur_bev_refined'])
-            if self.loss_fut_weight > 0:
-                l_fut, w = self.fut_loss(self._b_fut, t)
-                kd['bkd_fut'] = self.loss_fut_weight * l_fut
-                log_vars['bkd_w_max'] = w.max().item()
+            if self.branch and (self.loss_fut_weight > 0 or self.log_fut_split):
+                l_fut, w = self.fut_loss(b_fut, t)
+                if self.loss_fut_weight > 0:
+                    kd['bkd_fut'] = self.loss_fut_weight * l_fut
+                    log_vars['bkd_w_max'] = w.max().item()
                 if self._split is not None:
                     # same scale as bkd_fut (x loss_fut_weight), unweighted by w(x)
-                    log_vars['bkd_fut_pred'] = self.loss_fut_weight * self._split[0]
-                    log_vars['bkd_fut_floor'] = self.loss_fut_weight * self._split[1]
+                    if self.loss_fut_weight > 0:
+                        log_vars['bkd_fut_pred'] = self.loss_fut_weight * self._split[0]
+                        log_vars['bkd_fut_floor'] = self.loss_fut_weight * self._split[1]
+                    # per-element, weight-free (comparable across stages / lambdas)
+                    log_vars['fut_pred_raw'] = self._split[0]
+                    log_vars['fut_floor_raw'] = self._split[1]
                     self._split = None
             if self.loss_fused_weight > 0:
                 kd['bkd_fused'] = self.loss_fused_weight * F.mse_loss(fused, t['bev_refined'])

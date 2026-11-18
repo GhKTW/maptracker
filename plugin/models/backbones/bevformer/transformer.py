@@ -72,6 +72,9 @@ class PerceptionTransformer(BaseModule):
                     m.init_weight()
                 except AttributeError:
                     m.init_weights()
+        for m in self.modules():  # 11-13 seam-fix modules start as identity / plain average
+            if hasattr(m, 'reset_seam_params'):
+                m.reset_seam_params()
         normal_(self.level_embeds)
         normal_(self.cams_embeds)
         # xavier_init(self.reference_points, distribution='uniform', bias=0.)

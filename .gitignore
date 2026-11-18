@@ -158,3 +158,20 @@ vis_global
 vis_local
 
 md_files/
+
+# ---- local outputs / environment (not source) ----
+# checkpoints, training runs and logs
+ckpts/
+work_dirs/
+logs/
+outputs/
+.dist_test/
+# datasets, teacher caches, analysis outputs (datasets/taeu_outputs)
+/datasets
+# environment / third-party installs and caches
+.cache/
+third_party/
+# generated tracking G.T.
+tracking_gts/
+# Claude profile restore tool (local only)
+profile_guard/

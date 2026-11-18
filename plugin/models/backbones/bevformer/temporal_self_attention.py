@@ -193,7 +193,11 @@ class TemporalSelfAttention(BaseModule):
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
-        query = torch.cat([value[:bs], query], -1)
+        # value is ordered [prev_0, cur_0, prev_1, cur_1, ...] (stack on dim 1, then reshape), so value[:bs] is
+        # the previous BEV of every sample only for bs == 1; for bs > 1 sample j gets entry j of that list,
+        # i.e. the BEV of sample j // 2 (upstream behavior, kept unless batch_safe is set, 11-14)
+        prev = value[0::self.num_bev_queue] if getattr(self, 'batch_safe', False) else value[:bs]
+        query = torch.cat([prev, query], -1)
         value = self.value_proj(value)
 
         if key_padding_mask is not None:

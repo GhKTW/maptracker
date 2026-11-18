@@ -7,3 +7,5 @@ from .labelkd_distiller import LabelKDDistiller
 from .ftkd_contrast_distiller import FTKDContrastDistiller
 from .ftkd_contrast_distiller import FMKDContrastDistiller
 from .branch_kd import BranchKDDistiller
+from .struct_kd import StructKDDistiller
+from .oracle_bev import OracleBEVMapper
